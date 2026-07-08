@@ -1,0 +1,585 @@
+================================================================================
+PLAN-AHEAD CLUSTER OPTIMIZATION MODEL — SOURCE OF TRUTH
+plan_ahead_source_of_truth.txt
+(Reflects redesigned MISOCP model as of 2026-05-25: per-period exclusive
+ assignment, queue-size feedback, feedback applied to all tenants.)
+================================================================================
+EDITING CONVENTION
+  1. To change a symbol, update the GLOSSARY entry first.
+  2. Update every occurrence of that ASCII shorthand in the body below.
+  3. This file is the source of truth. The .tex file and .md files are derived
+     from this document — update here first, then regenerate.
+================================================================================
+
+
+GLOSSARY — ASCII shorthand to LaTeX mapping
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ASCII shorthand        LaTeX                                  Description
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Sets
+  T                    \mathcal{T}                            All tenants
+  T_e                  \mathcal{T}_e                          Exclusive tenants
+  T_s                  \mathcal{T}_s                          Shared tenants
+  T_h                  \mathcal{T}_s^h                        Heavy shared tenants
+  T_l                  \mathcal{T}_s^l                        Light shared tenants
+  M                    \mathcal{M}                            All machines
+  M_a                  \mathcal{M}_a                          Always-available machines
+  M_b                  \mathcal{M}_b                          Additional machines
+  H                    \mathcal{H}                            Planning periods
+
+  Decision Variables
+  e_inh                e_{i,n,h}          Exclusive assignment: 1 iff exclusive tenant i gets machine n in period h
+  z_on_n               z^{on}_n           Activation: 1 iff additional machine n is activated
+  z_nh                 z_{n,h}            Machine active: 1 iff machine n active in period h
+  y_inh                y_{i,n,h}          Shared assignment: 1 iff shared tenant i uses machine n in period h
+  f_inh                f_{i,n,h}          Allocation: capacity units of machine n to shared tenant i in period h
+  sigma                \sigma             Fairness: minimum demand-satisfaction ratio across all shared tenants
+  t_nh                 t_{n,h}            Cantelli slack: upper bound on weighted demand std dev (SOCP only)
+  hH_nh                \text{hH}_{n,h}    1 iff machine n has >=1 heavy tenant in period h
+  hL_nh                \text{hL}_{n,h}    1 iff machine n has >=1 light tenant in period h
+  mix_nh               \text{mix}_{n,h}   1 iff machine n has both heavy and light tenants in period h
+
+  Parameters — Machine
+  C_n                  C_n                Resource capacity of machine n (GB or capacity units)
+  C_eff_n              C^{eff}_n          Effective capacity after SLA feedback: C_eff_n = C_n*(1-alpha*v_bar_n)
+  pi_n                 \pi_n              Activation cost for additional machine n in M_b
+
+  Parameters — Demand
+  u_ih                 u_{i,h}            Expected demand of tenant i (ALL tenants) in period h, feedback-adjusted
+  u_max_i              u^{max}_i          Peak demand of exclusive tenant i: max_h u_{i,h} (feedback-adjusted)
+  sigma2_ih            \sigma^2_{i,h}     Demand variance: (sigma_frac * u_{raw,i,h})^2  (shared tenants only)
+
+  Parameters — Uncertainty
+  sigma_frac           \sigma_{frac}      Fractional uncertainty: std dev as fraction of u_{i,h} (default 0.20)
+  eps                  \varepsilon        Cantelli tail probability (default 0.10 -> 90% safety)
+  kappa                \kappa             Cantelli factor: sqrt((1-eps)/eps). eps=0.10 -> kappa=3.00
+
+  Parameters — Feedback
+  v_bar_n              \bar{v}_n          Rolling SLA violation rate on machine n (from realtime, rolling k-window)
+  W_bar_i              \bar{W}_i          Average scheduling wait time of tenant i in seconds (from realtime)
+  q_i                  q_i                Queued job count for tenant i at plan-ahead time (from realtime)
+  alpha                \alpha             Capacity shrinkage coefficient (default 0.5)
+  beta                 \beta              Wait-time demand inflation coefficient (default 0.3)
+  gamma                \gamma             Queue-size demand inflation coefficient (default 0.3)
+  W_bar_ref            \bar{W}_{ref}      Reference wait time in seconds (default 1.0; = BATCH_DURATION_SEC)
+  q_ref                q_{ref}            Reference queue size per tenant for normalisation (default 10)
+
+  Parameters — Policy
+  m_min                m_{min}            Minimum machines per shared tenant per period (default 2)
+
+  Parameters — Objective
+  lam_0                \lambda_0          Infrastructure cost weight
+  lam_1                \lambda_1          Fairness weight (maximise sigma)
+  lam_2                \lambda_2          Mix bonus weight (maximise mixing)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+================================================================================
+INTRODUCTION
+================================================================================
+
+The plan-ahead model is a Mixed-Integer Second-Order Cone Program (MISOCP)
+solved once per planning horizon (every horizon_steps simulation intervals).
+
+It answers: "Which machines should each tenant be assigned to for each planning
+period, given their estimated demand, machine pool, and feedback from the
+previous horizon?"
+
+IMPORTANT: MISOCP (use_socp=True) is the DEFAULT mode in ALL contexts:
+  - Simulation (every horizon_steps intervals)
+  - Pipeline (all samples: Simple, Medium, High)
+  - Sensitivity analysis
+  - All tests
+  MILP mode (use_socp=False) is available as an opt-in option only and is
+  NEVER enabled by default anywhere.
+
+Three-layer pipeline:
+  [Plan-Ahead MISOCP]  ---> runs once per horizon_steps intervals (default 24)
+                       ---> outputs: tenant groups + machine assignments per period
+  [Cluster Manager]    ---> per-interval loop; reads plan output for current period
+                       ---> filters jobs and machines per tenant group
+  [Real-Time MILP]     ---> called once per group per interval
+                       ---> places individual jobs; returns placement dict
+
+Feedback loop (after each horizon):
+  - Realtime reports violation rates v_bar_n (per machine, k-window rolling average)
+  - Realtime reports wait times W_bar_i (per tenant, k-window rolling average)
+  - Plan-ahead inflates demand for high-wait tenants and shrinks capacity of
+    overloaded machines on the next plan-ahead call
+
+
+================================================================================
+§1  SETS
+================================================================================
+
+  T = T_e ∪ T_s     All tenants
+
+  T_e                Exclusive tenants.
+                     - Receive dedicated machines per PERIOD (e[i,n,h] is per-period).
+                     - Machine assignment can change across periods based on feedback.
+                     - Machines assigned exclusively in period h are off-limits to
+                       shared tenants in that same period (C_sep constraint).
+
+  T_s = T \ T_e      Shared tenants.
+                     - May share machines with other shared tenants.
+                     - Assignment can change per period h.
+                     - Partitioned into heavy (T_h) and light (T_l) for mix bonus.
+                     T_h = { i in T_s : avg_h u_{i,h} >= median over T_s }
+                     T_l = T_s \ T_h
+
+  M = M_a ∪ M_b     All machines in the cluster pool.
+
+  M_a                Always-available machines (|M_a| = n_always_available).
+                     Always active (z_{n,h} = 1 forced). No activation cost.
+
+  M_b                Additional machines (M \ M_a).
+                     Model decides which to activate (z_on_n = 1).
+                     Activation cost pi_n applies.
+
+  H = {0, 1, ..., |H|-1}   Planning periods.
+                     Each period spans period_steps simulation intervals.
+                     |H| = max(1, horizon_steps // period_steps)
+
+
+================================================================================
+§2  PARAMETERS
+================================================================================
+
+Machine parameters:
+  C_n          Resource capacity of machine n (in GB or capacity units)
+  C_eff_n      Effective capacity after feedback:
+               C_eff_n = C_n * (1 - alpha * v_bar_n)
+               High violation rate -> smaller effective capacity -> fewer tenants
+  pi_n         Activation cost for additional machine n in M_b
+
+Tenant demand parameters:
+  u_{i,h}      Feedback-adjusted demand of tenant i (ALL tenants: exclusive + shared)
+               in period h. Computed in plan_ahead_data.build_synthetic_data():
+
+               wait_scale  = 1 + beta  * min(2, W_bar_i / W_bar_ref)
+               queue_scale = 1 + gamma * min(2, q_i / q_ref)
+               scale       = min(3.0, wait_scale * queue_scale)
+               u_{i,h}     = u_raw_{i,h} * scale
+
+               Feedback applies to ALL tenants including exclusive ones.
+               The min(2,...) cap and overall min(3.0,...) cap prevent infeasibility.
+
+  u_max_i      Peak demand of exclusive tenant i: max_{h in H} u_{i,h}
+               (feedback-adjusted; used for reporting, not in MISOCP constraints)
+
+  sigma^2_{i,h} Demand variance: (sigma_frac * u_raw_{i,h})^2
+               Only for shared tenants. Cantelli buffer sized by raw uncertainty.
+
+Uncertainty parameters:
+  sigma_frac   std dev of actual demand as fraction of u_raw_{i,h} (default 0.20)
+  eps          Cantelli tail probability (default 0.10 -> 90% coverage)
+  kappa        Cantelli safety factor: sqrt((1-eps)/eps)
+               eps=0.10 -> kappa=3.00
+               eps=0.05 -> kappa=4.36
+
+Feedback parameters:
+  v_bar_n      Rolling SLA violation rate per machine (fraction, [0,1])
+               Computed over last k_window intervals from realtime layer.
+  W_bar_i      Average scheduling wait time per tenant (seconds, from realtime).
+               Each unplaced interval adds BATCH_DURATION_SEC (=1 sec) to tenant wait.
+  q_i          Number of jobs queued for tenant i at plan-ahead firing time.
+               Collected by Cluster Manager from job_queue before plan-ahead call.
+  alpha        Capacity shrinkage coefficient (default 0.5)
+               C_eff_n = C_n * (1 - 0.5 * v_bar_n): 100% violation halves capacity.
+  beta         Wait-time demand inflation coefficient (default 0.3)
+               At W_bar_i = W_bar_ref: wait_scale = 1.30 (30% demand inflation)
+  gamma        Queue-size demand inflation coefficient (default 0.3)
+               At q_i = q_ref: queue_scale = 1.30 (30% demand inflation)
+  W_bar_ref    Reference wait time in seconds (default 1.0 = BATCH_DURATION_SEC)
+               At W_bar_i = 1 sec (one unplaced interval): wait_scale = 1.30.
+               At W_bar_i = 2 sec: wait_scale hits cap 1.60.
+  q_ref        Reference queue size per tenant (default 10 jobs)
+               At q_i = 10 queued jobs: queue_scale = 1.30.
+               At q_i = 20+ queued jobs: queue_scale hits cap 1.60.
+
+Policy parameters:
+  m_min        Minimum machines per shared tenant per period (default 2).
+               Ensures resilience: tenants can absorb one machine spike/failure.
+               Calibrated with SOCP demand thresholds: with epsilon=0.10 and
+               sigma_frac=0.20, kappa=3.0, a single node can absorb demand up to
+               C_n / (1 + kappa*sigma_frac) = C_n / 1.6. Setting usage > C_n/1.6
+               forces the model to assign m_min >= 2 naturally via SOCP physics.
+
+Objective weights:
+  lam_0        Infrastructure cost weight (default: infra cost zeroed in sim = 0.0)
+  lam_1        Fairness weight (positive -> maximises sigma, default 5.0 in tests)
+  lam_2        Mix bonus weight (default 2.0 in tests)
+
+
+================================================================================
+§3  DECISION VARIABLES
+================================================================================
+
+  e_{i,n,h}    in {0,1}    1 iff exclusive tenant i in T_e is assigned machine n in
+                            period h. PER-PERIOD: can change across planning periods.
+                            Feedback drives the per-period machine count up or down.
+
+  z_on_{n}     in {0,1}    1 iff additional machine n in M_b is activated.
+                            Activation cost pi_n applies when z_on_n = 1.
+
+  z_{n,h}      in {0,1}    1 iff machine n is active in period h.
+                            For M_a: forced to 1 by C_aa.
+                            For M_b: z_{n,h} <= z_on_n (by C_act).
+
+  y_{i,n,h}    in {0,1}    1 iff shared tenant i in T_s is assigned machine n in
+                            period h. This is the primary output: it defines which
+                            machines the Cluster Manager uses for each tenant group.
+
+  f_{i,n,h}    >= 0        Capacity allocated from machine n to shared tenant i in
+                            period h. Used to model demand satisfaction and SOCP.
+
+  sigma        in [0,1]    Minimum demand-satisfaction ratio across all shared
+                            tenants (fairness measure, maximised in objective).
+
+  t_{n,h}      >= 0        Cantelli slack (SOCP mode only). Upper bound on the
+                            weighted demand std dev on machine n in period h.
+                            solver sizes this as: t_{n,h} >= sqrt(sum_i sigma2*y)
+
+  hH_{n,h}     in {0,1}    1 iff machine n has >= 1 heavy-demand tenant in period h.
+  hL_{n,h}     in {0,1}    1 iff machine n has >= 1 light-demand tenant in period h.
+  mix_{n,h}    in {0,1}    1 iff machine n has BOTH heavy and light tenants in h.
+                            Rewarded by lam_2 in objective (co-location bonus).
+
+
+================================================================================
+§4  CONSTRAINTS
+================================================================================
+
+Machine Activation
+──────────────────
+
+C_aa (Always Available):
+  z_{n,h} = 1    for all n in M_a, h in H
+  Always-on machines are always active.
+
+C_act (Additional Machine Activation):
+  z_{n,h} <= z_on_n    for all n in M_b, h in H
+  Additional machines active only if switched on.
+
+C_zact (Machine Active if Shared Assigned):
+  z_{n,h} >= y_{i,n,h}    for all i in T_s, n in M, h in H
+  A machine must be active whenever any shared tenant is assigned to it.
+
+C_zact_excl (Machine Active if Exclusive Assigned):
+  z_{n,h} >= e_{i,n,h}    for all i in T_e, n in M, h in H
+  A machine must be active whenever any exclusive tenant is assigned to it.
+  Chains with C_act to force z_on_n = 1 for any additional machine used by
+  an exclusive tenant in any period.
+
+Exclusive Tenant Constraints
+────────────────────────────
+
+C_excl1 (At Most One Exclusive Per Machine Per Period):
+  sum_{i in T_e} e_{i,n,h} <= 1    for all n in M, h in H
+  Each machine can be held exclusively by at most one exclusive tenant per period.
+
+C_excl2 (Each Exclusive Must Be Assigned Per Period):
+  sum_{n in M} e_{i,n,h} >= 1    for all i in T_e, h in H
+  Every exclusive tenant must receive at least one machine in every period.
+
+C_excl_cap (Exclusive Capacity Coverage Per Period):
+  sum_{n in M} e_{i,n,h} * C_eff_n >= u_{i,h}    for all i in T_e, h in H
+  Machines assigned exclusively to tenant i in period h must provide enough
+  effective capacity to cover the tenant's feedback-adjusted per-period demand.
+  Uses C_eff_n (not C_n) so feedback-shrunk capacity is accounted for.
+
+C_sep (Exclusive-Shared Separation):
+  sum_{i in T_e} e_{i,n,h} + y_{j,n,h} <= 1
+    for all j in T_s, n in M, h in H
+  A machine assigned exclusively to any exclusive tenant in period h cannot be
+  used by any shared tenant in that same period.
+
+Shared Tenant Constraints
+──────────────────────────
+
+C_share (Minimum Machine Assignment):
+  sum_{n in M} y_{i,n,h} >= m_min    for all i in T_s, h in H
+  Every shared tenant receives at least m_min machines per period.
+  Default m_min = 2 (configurable via min_machines_per_tenant).
+  Provides resilience and distributes demand across multiple nodes.
+
+C1a (Capacity with Cantelli Safety Buffer):
+  sum_{i in T_s} f_{i,n,h} + kappa * t_{n,h} <= C_eff_n * z_{n,h}
+    for all n in M, h in H
+  Total allocation plus the Cantelli safety buffer fits within effective capacity.
+  In MILP mode: same without the kappa*t term (t absent).
+
+C1b (Cantelli Cone — SOCP only):
+  sum_{i in T_s} sigma^2_{i,h} * y_{i,n,h} <= t_{n,h}^2
+    for all n in M, h in H
+  Second-order cone: t_{n,h} >= sqrt(sum_i sigma2_{i,h} * y_{i,n,h}).
+  Together C1a + C1b guarantee:
+    P[ total demand on machine n in period h <= C_eff_n ] >= 1 - eps
+
+C2 (Priority Link):
+  f_{i,n,h} <= C_n * y_{i,n,h}    for all i in T_s, n in M, h in H
+  Allocation can only occur where the tenant is assigned (y=1).
+
+C3 (Demand Satisfaction):
+  sum_{n in M} f_{i,n,h} >= u_fb_{i,h}    for all i in T_s, h in H
+  Every shared tenant receives at least its feedback-adjusted demand.
+
+C4 (Fairness — Min Demand-Satisfaction Ratio):
+  sigma <= (sum_{n,h} f_{i,n,h}) / (sum_h u_fb_{i,h})
+    for all i in T_s where sum_h u_fb_{i,h} > 0
+  sigma is the minimum fraction of total demand satisfied across all shared
+  tenants. Maximised in objective.
+
+Mix Bonus Constraints (linearised AND gate):
+  hH_{n,h} >= y_{i,n,h}            for all i in T_h, n in M, h in H
+  hL_{n,h} >= y_{j,n,h}            for all j in T_l, n in M, h in H
+  mix_{n,h} <= hH_{n,h}            for all n, h
+  mix_{n,h} <= hL_{n,h}            for all n, h
+  mix_{n,h} >= hH_{n,h} + hL_{n,h} - 1    for all n, h
+  mix_{n,h} = 1 iff machine n has >=1 heavy AND >=1 light tenant in period h.
+
+
+================================================================================
+§5  PROBABILISTIC CAPACITY CONSTRAINT (SOCP)
+================================================================================
+
+Why Cantelli?
+  We know only the mean u_{i,h} and variance sigma^2_{i,h} of tenant demand —
+  not the full distribution. Cantelli's inequality is distribution-free: it
+  provides a one-sided safety bound using only mean and variance.
+
+Model:
+  Actual demand of shared tenant i on machine n in period h is a random variable
+  with mean f_{i,n,h} and variance sigma^2_{i,h} * y_{i,n,h}.
+  (Variance is zero when the tenant is not assigned to the machine.)
+
+Cantelli bound:
+  P[ D_{n,h} > mu_{n,h} + kappa * sigma_tot_{n,h} ] <= eps
+  where: mu_{n,h} = sum_i f_{i,n,h}
+         sigma_tot_{n,h}^2 = sum_i sigma^2_{i,h} * y_{i,n,h}
+
+C1a + C1b enforce: mu_{n,h} + kappa * sigma_tot_{n,h} <= C_eff_n * z_{n,h}
+which gives: P[ D_{n,h} <= C_eff_n * z_{n,h} ] >= 1 - eps
+
+For eps=0.10, kappa=3.00: 90% probability of no overflow under worst-case
+demand distribution consistent with the given mean and variance.
+
+Practical implication:
+  A single machine of capacity C_n can absorb demand from one tenant i without
+  violating C1a only if:
+    f_{i,n,h} + kappa * sigma_frac * u_{i,h} <= C_n
+  => u_{i,h} * (1/1 + kappa*sigma_frac) <= C_n
+  => u_{i,h} <= C_n / (1 + kappa*sigma_frac) = one_node_max
+
+  For C_n=40 GB, kappa=3, sigma_frac=0.20:
+    one_node_max = 40 / (1 + 3*0.20) = 40 / 1.6 = 25 GB
+
+  Setting usage_min > 25 GB forces the model to assign >= 2 machines per tenant,
+  which is the key design choice that ensures m_min >= 2 naturally.
+
+  Note: sigma^2 is based on the PRE-FEEDBACK demand u_{i,h}, not u_fb_{i,h}.
+  This means the Cantelli buffer is sized by the base uncertainty level, while
+  C3 requires satisfying the inflated (feedback-adjusted) demand.
+
+
+================================================================================
+§6  OBJECTIVE
+================================================================================
+
+  Minimize:
+    lam_0 * INFRA_COST
+    - lam_1 * sigma
+    - lam_2 * MIX_TOTAL
+
+  where:
+    INFRA_COST  = sum_{n in M_b} pi_n * z_on_n
+                  (cost of activating additional machines)
+    sigma       = minimum demand-satisfaction ratio across shared tenants
+    MIX_TOTAL   = sum_{n in M, h in H} mix_{n,h}
+                  (total machine-period pairs with both heavy + light tenants)
+
+  In simulation:
+    lam_0 = 0.0 (infra cost zeroed — always-on machines are pre-paid;
+                  model distributes freely rather than packing into minimum)
+    lam_1 > 0   (fairness rewarded)
+    lam_2 > 0   (mixing rewarded)
+
+
+================================================================================
+§7  FEEDBACK INTEGRATION
+================================================================================
+
+After each planning horizon, the realtime layer reports:
+  - v_bar_n: rolling SLA violation rate per machine (rolling k_window average)
+  - W_bar_i: average scheduling wait time per tenant (seconds, k_window average)
+  - q_i:     number of jobs queued for tenant i at plan-ahead time
+
+These update plan parameters for the NEXT horizon:
+
+  Capacity feedback (applies to machines):
+    C_eff_n = C_n * (1 - alpha * v_bar_n)
+
+  Demand feedback (applies to ALL tenants — exclusive AND shared):
+    wait_scale  = 1 + beta  * min(2, W_bar_i / W_bar_ref)
+    queue_scale = 1 + gamma * min(2, q_i / q_ref)
+    scale       = min(3.0, wait_scale * queue_scale)
+    u_{i,h}     = u_raw_{i,h} * scale
+
+WHY feedback applies to exclusive tenants:
+  Previously only shared tenants got feedback-adjusted demand. This meant
+  exclusive tenants with 100+ queued jobs still got a single machine assignment
+  because their demand was always computed from raw values. Now, if an exclusive
+  tenant is queueing jobs, its inflated demand triggers C_excl_cap to require
+  more machines in the next period, taking from inactive (M_b) machines first.
+
+Effect of each signal:
+  - High violation rate (v_bar_n -> 1): C_eff_n shrinks toward 0.5 * C_n.
+    Fewer tenants pack onto the stressed machine.
+  - High wait time (W_bar_i >= W_bar_ref = 1 sec): wait_scale = 1.30.
+    (W_bar_ref = BATCH_DURATION_SEC = 1 sec; after 1 unplaced interval, signal fires.)
+  - High queue (q_i >= q_ref = 10 jobs): queue_scale = 1.30.
+    (After 10 queued jobs, inflated demand forces the model to assign more machines.)
+  - Combined: at q_i=10 and W_bar_i=1 sec, scale = 1.30 * 1.30 = 1.69x.
+
+Machine source when demand inflates:
+  - The model takes from inactive additional machines (M_b) first (z_on cost = 0
+    in simulation: lam_0=0).
+  - If M_b is exhausted, it shifts machines from under-utilised tenant groups.
+
+Default calibration (simulation DEFAULT_CONFIG):
+  alpha=0.5, beta=0.3, gamma=0.3, W_bar_ref=1.0 sec, q_ref=10 jobs
+  horizon_steps=24, period_steps=6 (4 planning periods per horizon)
+  total_nodes=20, always_on_nodes=7, node_mem [64 GB – 256 GB]
+  max_lifetime_sec=20, jobs per interval: 0–10 drawn from N(5, 1.7)
+
+First run (no history):
+  v_bar_n = 0.0 for all n -> C_eff_n = C_n (no capacity shrinkage)
+  W_bar_i = 0.0 for all i, q_i = 0 -> scale = 1.0 (no demand inflation)
+
+
+================================================================================
+§8  OUTPUT FORMAT AND REALTIME INTEGRATION
+================================================================================
+
+Plan output structure:
+  {
+    "intervals": [
+      {
+        "interval": 0,   # period index h in H
+        "groups": [
+          {
+            "tenant_ids":  [i_excl],            # exclusive group
+            "machine_ids": [n1, n2],
+            "exclusive":   True
+          },
+          {
+            "tenant_ids":  [i1, i2, i3],        # shared group (all shared tenants)
+            "machine_ids": [n3, n4, n5, n6],
+            "exclusive":   False
+          }
+        ]
+      },
+      { "interval": 1, "groups": [...] },
+      ...
+    ]
+  }
+
+How the Cluster Manager uses this:
+  Each scheduling interval:
+  1. Resolve period h = (sim_interval // period_steps) % |H|
+  2. Get group list for period h
+  3. For each group in order:
+     a. Sort queue to jobs in group's tenant_ids (FIFO: oldest first by arrival_round)
+     b. Filter nodes to group's machine_ids
+     c. Call realtime solver: placements = solve(group_jobs, group_nodes, W_t, K)
+     d. Place assigned jobs; unplaced jobs get wait bump and stay in queue
+  4. Remove placed jobs from queue; update W_t
+
+FIFO ordering:
+  group_jobs = sorted(queue_jobs_in_group, key=lambda j: j.arrival_round)
+  Oldest jobs are presented first to the solver. Their accumulated W_t weight
+  boosts their priority weight in the solver objective, ensuring long-waiting
+  jobs are served before newer arrivals.
+
+Exclusive vs shared:
+  - Exclusive groups: one group per exclusive tenant, dedicated machines.
+  - Shared group: all shared tenants in one group, can use any of their assigned
+    machines. Tenants within the group compete for the machines via the realtime
+    MILP, with W_t weighting providing fair scheduling.
+
+
+================================================================================
+§9  SOLVER CONFIGURATION
+================================================================================
+
+Model class: Mixed-Integer Second-Order Cone Program (MISOCP)
+Solver: Gurobi (requires valid WLS academic or commercial license)
+
+Default parameters:
+  use_socp = True     (MISOCP mode; ALWAYS default everywhere)
+  TimeLimit = 30 s    (simulation); 120 s (tests)
+  MIPGap    = 0.05    (5% optimality gap, sufficient for planning)
+
+Variable counts (approximate):
+  Binary:     |T_s|*|M|*|H|  (y vars)
+            + |M_b|          (z_on vars)
+            + |T_e|*|M|*|H|  (e vars — per-period, up from |T_e|*|M|)
+            + |M|*|H|        (z vars)
+            + 3*|M|*|H|      (mix: hH, hL, mix vars)
+  Continuous: |T_s|*|M|*|H|  (f vars)
+            + |M|*|H|        (t vars, SOCP only)
+            + 1              (sigma)
+
+Typical scale:
+  Small (4 tenants, 8 nodes, 3 periods): ~500 binary vars, ~200 continuous
+  Medium (8 tenants, 15 nodes, 4 periods): ~3000 binary vars, ~700 continuous
+  Large (15 tenants, 25 nodes, 8 periods): ~12000 binary vars, ~3000 continuous
+
+Feasibility conditions:
+  - Enough machines so that m_min machines per tenant can be assigned without
+    violating C_sep (exclusive machines not shared).
+  - u_{i,h} + kappa*sigma_frac*u_{i,h} <= sum_n C_eff_n (across enough machines)
+    i.e., u_{i,h} * (1 + kappa*sigma_frac) <= m_min * C_n approximately.
+  - Feedback inflation must not push u_fb above the feasible demand ceiling.
+    The min(2,...) cap ensures max scale = 1 + beta*2 = 1.60.
+
+Sensitivity summary (from plan_ahead_sensitivity.py):
+  - epsilon in [0.05, 0.30]: feasible. Below 0.05 (kappa > 4.36): infeasible
+    due to oversized Cantelli buffer.
+  - Exclusive count: objective drops sharply when T_e > |T|/2 (shared pool too small)
+  - Node capacity: needs C_n >= u_ih / (1+kappa*sigma_frac) for at least m_min nodes
+  - lam1 (fairness): sigma jumps to 1.0 for lam1 > 0 on balanced instances
+  - lam2 (mix bonus): objective grows linearly, promoting co-location aggressively
+
+
+================================================================================
+§10  CONNECTION TO CAPSTONE PAPER / PRIOR FORMULATION
+================================================================================
+
+The original (Chaudhari 2025-inspired) formulation used:
+  - Per-workload covariance matrix Sigma_r (requires workload-level data)
+  - Admission variables a_i (tenants could be rejected)
+  - Revenue terms pi_bar_i, v_op_i (billing model)
+  - Priority hints (y was a soft signal, not a hard assignment)
+
+The current formulation changes:
+  1. Tenant-level vs workload-level: u_{i,h} is aggregate tenant demand,
+     not per-workload. This is more practical (forecastable from history).
+  2. No admission rejection: all tenants are always served (C_share enforced).
+     This matches multi-tenant SLA requirements where rejecting is not allowed.
+  3. Exclusive/shared split: formal T_e / T_s partition handles mixed workloads
+     (isolation-required tenants vs shared-pool tenants).
+  4. Hard assignments: y_{i,n,h}=1 means the Cluster Manager actually sends
+     tenant i's jobs to machine n. Not a priority hint — a hard routing decision.
+  5. MISOCP default: SOCP mode is always on. MILP mode was needed only for
+     debugging; the cone is what makes the formulation academically rigorous.
+  6. Feedback loop: v_bar_n, W_bar_i, q_i fed from realtime into plan-ahead
+     parameters, creating a closed control loop (adaptive scheduling).
+     Key redesign: feedback now applies to ALL tenants (inclusive of exclusive),
+     e[i,n] is per-period (e[i,n,h]), and queue-size (q_i) is a second feedback
+     signal so exclusive tenants with heavy queuing get more machines next period.
+
+
+================================================================================
+END OF SOURCE OF TRUTH
+================================================================================
