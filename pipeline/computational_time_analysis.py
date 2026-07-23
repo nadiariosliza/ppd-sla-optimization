@@ -1015,7 +1015,7 @@ def run_pa_small_oneshot(tenants_list=None, nodes_list=None, periods=None) -> No
                "build_s", "solve_s", "total_s", "mip_gap", "status"], rows)
 
 
-def main() -> None:
+def main(skip_rt: bool = False) -> None:
     global _T0
     _T0 = time.perf_counter()
 
@@ -1220,6 +1220,10 @@ if __name__ == "__main__":
         "--graphs-only", action="store_true",
         help="Skip timing; regenerate all plots from saved rt_timing.csv / pa_timing_grid.csv",
     )
+    _parser.add_argument(
+        "--skip-rt", action="store_true",
+        help="Skip Real-Time analysis, run Plan-Ahead only",
+    )
     _args = _parser.parse_args()
 
     if _args.graphs_only:
@@ -1231,4 +1235,4 @@ if __name__ == "__main__":
             _generate_plots(_rt, _pa)
             print("  Done.")
     else:
-        main()
+        main(skip_rt=_args.skip_rt)
