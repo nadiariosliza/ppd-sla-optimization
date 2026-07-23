@@ -181,6 +181,26 @@ PA_ALWAYS_FRAC     = 0.5    # fraction of nodes that are always-on (M_a)
 PA_EXCL_FRAC       = 0.20   # fraction of tenants tagged as exclusive (T_e)
 PA_MIP_GAP         = 0.01   # Gurobi relative optimality gap target
 
+# ── Scalability experiments ────────────────────────────────────────────────
+# Experiment A — Solver cap comparison
+EXP_A_CAP_S        = 2 * 60 * 60   # 2 hours
+EXP_A_TENANTS      = [2, 8, 128, 256, 512]
+EXP_A_NODES        = [4, 16, 64, 256, 512, 1024]
+EXP_A_PERIODS      = 4
+
+# Experiment B — Period granularity sweep (subset grid, 5-min cap)
+EXP_B_PERIODS_LIST = [2, 4, 6, 8]  # number of planning slots
+EXP_B_TENANTS      = [2, 8, 128]   # subset only — larger T not needed
+EXP_B_NODES        = [64, 256, 1024]
+EXP_B_CAP_S        = 5 * 60        # 5 minutes (same as baseline)
+
+# Experiment C — Weekly horizon (P=7, one 24-hour slot per day, 4-hour cap)
+EXP_C_PERIODS      = 7             # 7 daily slots = 1 week
+EXP_C_SLOT_HOURS   = 24            # hours per slot
+EXP_C_CAP_S        = 4 * 60 * 60  # 4 hours
+EXP_C_TENANTS      = [2, 8, 128, 256, 512]
+EXP_C_NODES        = [4, 16, 64, 256, 512, 1024]
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # § DATA CLASSES
@@ -212,6 +232,27 @@ class PAResult:
     obj_val:     float | None  # objective value at termination
     mip_gap:     float | None
     status:      str    # "OPT" | "TLim" | "INF" | "SKIP" | "ERR"
+
+
+@dataclass
+class ExperimentResult:
+    """Extended PAResult with experiment metadata."""
+    experiment:  str           # "cap_sweep" | "period_sweep" | "weekly"
+    n_tenants:   int
+    n_nodes:     int
+    n_periods:   int
+    slot_hours:  float         # hours per planning slot
+    solver_cap_s: int          # solver time limit used
+    n_vars:      int
+    n_bin_vars:  int
+    n_cont_vars: int
+    n_constrs:   int
+    build_s:     float
+    solve_s:     float
+    total_s:     float
+    obj_val:     float | None
+    mip_gap:     float | None
+    status:      str
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -411,6 +452,198 @@ def time_pa(n_tenants: int, n_nodes: int, n_periods: int) -> PAResult:
         n_constrs=n_constrs,
         build_s=build_s, solve_s=solve_s, total_s=total_s,
         obj_val=obj_val, mip_gap=gap, status=status,
+    )
+
+
+def time_pa_experiment(
+    experiment: str,
+    n_tenants: int,
+    n_nodes: int,
+    n_periods: int,
+    slot_hours: float,
+    solver_cap_s: int,
+) -> ExperimentResult:
+    """Run one PA MISOCP cell with custom periods and solver cap.
+    Mirrors time_pa() but accepts experiment-specific parameters.
+    """
+    n_always = max(1, int(n_nodes * PA_ALWAYS_FRAC))
+    n_excl   = min(max(1, int(n_tenants * PA_EXCL_FRAC)), n_tenants - 1)
+
+    min_cap = (n_tenants * PA_USAGE_MAX) / max(1, n_nodes) * 1.3
+    cap     = max(PA_NODE_CAPACITY, min_cap)
+    cap     = min(cap, 500.0)
+    usage_max = min(PA_USAGE_MAX, cap * 0.70)
+    usage_min = min(PA_USAGE_MIN, usage_max * 0.50)
+
+    P = build_synthetic_data(
+        seed=SEED, n_tenants=n_tenants, n_nodes=n_nodes, n_intervals=n_periods,
+        node_capacity=cap, n_always_available=n_always, n_exclusive=n_excl,
+        tenant_usage_min=usage_min, tenant_usage_max=usage_max,
+        sigma_frac=0.20, epsilon=0.10, min_machines_per_tenant=1,
+    )
+
+    env = make_gurobi_env()
+    try:
+        t_build = time.perf_counter()
+        model, _ = build_model(P, env, use_socp=True)
+        build_s = time.perf_counter() - t_build
+
+        model.Params.LogToConsole = 0
+        model.Params.OutputFlag   = 0
+        model.Params.TimeLimit    = solver_cap_s
+        model.Params.MIPGap       = PA_MIP_GAP
+        model.Params.Threads      = max(1, (os.cpu_count() or 4) // 4)
+
+        n_vars = model.NumVars
+        model.optimize()
+        solve_s = model.Runtime
+
+        n_bin_vars  = model.NumBinVars
+        n_cont_vars = model.NumVars - model.NumBinVars
+        n_constrs   = model.NumConstrs + model.NumQConstrs + model.NumGenConstrs
+        try:    obj_val = model.ObjVal
+        except: obj_val = None
+
+        sc = model.Status
+        if sc == GRB.OPTIMAL:
+            status, gap = "OPT", model.MIPGap
+        elif sc == GRB.TIME_LIMIT:
+            status = "TLim"
+            try:    gap = model.MIPGap
+            except: gap = None
+        elif sc in (GRB.INFEASIBLE, GRB.INF_OR_UNBD):
+            status, gap = "INF", None
+        else:
+            status, gap = f"S{sc}", None
+
+        model.dispose()
+        env.dispose()
+
+    except Exception as exc:
+        _pr(f"EXP-{experiment}  T={n_tenants:<5} N={n_nodes:<5} P={n_periods} ERR: {exc}")
+        try: env.dispose()
+        except: pass
+        n_excl_est = min(max(1, int(n_tenants * PA_EXCL_FRAC)), n_tenants - 1)
+        n_v = _pa_var_estimate(n_tenants, n_nodes, n_periods, n_excl_est)
+        return ExperimentResult(
+            experiment=experiment, n_tenants=n_tenants, n_nodes=n_nodes,
+            n_periods=n_periods, slot_hours=slot_hours, solver_cap_s=solver_cap_s,
+            n_vars=n_v, n_bin_vars=0, n_cont_vars=0, n_constrs=0,
+            build_s=0.0, solve_s=0.0, total_s=0.0,
+            obj_val=None, mip_gap=None, status="ERR",
+        )
+
+    total_s = build_s + solve_s
+    labels  = {"OPT": "OPTIMAL", "TLim": "CAPPED", "INF": "INFEASIBLE"}
+    _pr(f"EXP-{experiment}  T={n_tenants:<5} N={n_nodes:<5} P={n_periods} "
+        f"→ {total_s:>10.2f} s  vars={n_vars:,}  [{labels.get(status, status)}]")
+
+    return ExperimentResult(
+        experiment=experiment, n_tenants=n_tenants, n_nodes=n_nodes,
+        n_periods=n_periods, slot_hours=slot_hours, solver_cap_s=solver_cap_s,
+        n_vars=n_vars, n_bin_vars=n_bin_vars, n_cont_vars=n_cont_vars,
+        n_constrs=n_constrs,
+        build_s=build_s, solve_s=solve_s, total_s=total_s,
+        obj_val=obj_val, mip_gap=gap, status=status,
+    )
+
+
+def _run_experiment(
+    experiment: str,
+    tenants_list: list,
+    nodes_list: list,
+    periods_list: list,
+    slot_hours: float,
+    solver_cap_s: int,
+    csv_name: str,
+) -> list:
+    """Run a grid of (T, N, P) cells concurrently and save to CSV."""
+    valid_cells = [
+        (t, n, p) for t in tenants_list for n in nodes_list for p in periods_list
+        if n >= t
+    ]
+    skip_cells = [
+        (t, n, p) for t in tenants_list for n in nodes_list for p in periods_list
+        if n < t
+    ]
+
+    cap_label = f"{solver_cap_s//3600}h" if solver_cap_s >= 3600 else f"{solver_cap_s//60}min"
+    _hdr(f"EXPERIMENT {experiment.upper()} — cap={cap_label}  P={periods_list}  "
+         f"horizon={int(max(periods_list)*slot_hours)}h")
+    print(f"  Grid   : T={tenants_list}  N={nodes_list}  P={periods_list}")
+    print(f"  Cap    : {cap_label} per cell")
+    print(f"  Slot   : {slot_hours}h per period  "
+          f"(horizon = {int(max(periods_list)*slot_hours)}h)")
+    print(f"  Cells  : {len(valid_cells)} active, {len(skip_cells)} skipped (N < T)")
+    print()
+
+    # Skip rows
+    results = []
+    for t, n, p in skip_cells:
+        n_excl_est = min(max(1, int(t * PA_EXCL_FRAC)), t - 1)
+        n_v = _pa_var_estimate(t, n, p, n_excl_est)
+        results.append(ExperimentResult(
+            experiment=experiment, n_tenants=t, n_nodes=n,
+            n_periods=p, slot_hours=slot_hours, solver_cap_s=solver_cap_s,
+            n_vars=n_v, n_bin_vars=0, n_cont_vars=0, n_constrs=0,
+            build_s=0.0, solve_s=0.0, total_s=0.0,
+            obj_val=None, mip_gap=None, status="SKIP",
+        ))
+
+    # Run valid cells concurrently
+    with ThreadPoolExecutor(max_workers=max(1, len(valid_cells))) as pool:
+        futures = {
+            pool.submit(
+                time_pa_experiment, experiment, t, n, p, slot_hours, solver_cap_s
+            ): (t, n, p)
+            for t, n, p in valid_cells
+        }
+        for fut in as_completed(futures):
+            results.append(fut.result())
+
+    # Save CSV
+    _save_csv(csv_name,
+              ["experiment", "n_tenants", "n_nodes", "n_periods", "slot_hours",
+               "solver_cap_s", "n_vars", "n_bin_vars", "n_cont_vars", "n_constrs",
+               "build_s", "solve_s", "total_s", "obj_val", "mip_gap", "status"],
+              [[r.experiment, r.n_tenants, r.n_nodes, r.n_periods, r.slot_hours,
+                r.solver_cap_s, r.n_vars, r.n_bin_vars, r.n_cont_vars, r.n_constrs,
+                round(r.build_s, 4), round(r.solve_s, 4), round(r.total_s, 4),
+                round(r.obj_val, 4) if r.obj_val is not None else "",
+                round(r.mip_gap, 6) if r.mip_gap is not None else "",
+                r.status]
+               for r in sorted(results, key=lambda x: (x.n_tenants, x.n_nodes, x.n_periods))])
+    return results
+
+
+def run_exp_a() -> list:
+    """Experiment A: 2-hour cap, same grid as baseline."""
+    return _run_experiment(
+        experiment="cap_sweep",
+        tenants_list=EXP_A_TENANTS, nodes_list=EXP_A_NODES,
+        periods_list=[EXP_A_PERIODS], slot_hours=6.0,
+        solver_cap_s=EXP_A_CAP_S, csv_name="pa_cap_sweep.csv",
+    )
+
+
+def run_exp_b() -> list:
+    """Experiment B: period granularity sweep, 24h horizon."""
+    return _run_experiment(
+        experiment="period_sweep",
+        tenants_list=EXP_B_TENANTS, nodes_list=EXP_B_NODES,
+        periods_list=EXP_B_PERIODS_LIST,
+        slot_hours=6.0,   # 24h / 4 periods = 6h per slot (varies with P)
+        solver_cap_s=EXP_B_CAP_S, csv_name="pa_period_sweep.csv",
+    )
+
+
+def run_exp_c() -> list:
+    """Experiment C: weekly horizon P=7, 4-hour cap."""
+    return _run_experiment(
+        experiment="weekly",
+        tenants_list=EXP_C_TENANTS, nodes_list=EXP_C_NODES,
+        periods_list=[EXP_C_PERIODS], slot_hours=float(EXP_C_SLOT_HOURS),
+        solver_cap_s=EXP_C_CAP_S, csv_name="pa_weekly.csv",
     )
 
 
@@ -1224,6 +1457,11 @@ if __name__ == "__main__":
         "--skip-rt", action="store_true",
         help="Skip Real-Time analysis, run Plan-Ahead only",
     )
+    _parser.add_argument(
+        "--mode", choices=["cap_sweep", "period_sweep", "weekly"],
+        default=None,
+        help="Run a specific scalability experiment instead of the baseline",
+    )
     _args = _parser.parse_args()
 
     if _args.graphs_only:
@@ -1234,5 +1472,14 @@ if __name__ == "__main__":
         else:
             _generate_plots(_rt, _pa)
             print("  Done.")
+    elif _args.mode == "cap_sweep":
+        _T0 = time.perf_counter()
+        run_exp_a()
+    elif _args.mode == "period_sweep":
+        _T0 = time.perf_counter()
+        run_exp_b()
+    elif _args.mode == "weekly":
+        _T0 = time.perf_counter()
+        run_exp_c()
     else:
         main(skip_rt=_args.skip_rt)
