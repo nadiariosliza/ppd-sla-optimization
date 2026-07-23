@@ -139,6 +139,7 @@ class IterTenant:
 class IterNode:
     node_id:   int
     remaining: dict[int, float]   # period h → remaining capacity
+    tenants_assigned: set = field(default_factory=set)  # tenant_ids assigned to this node
 
     def max_remaining(self) -> float:
         return max(self.remaining.values()) if self.remaining else 0.0
@@ -204,6 +205,7 @@ def _allocate_greedy(tenants: list[IterTenant], nodes: list[IterNode]) -> float:
             alloc = min(rem, avail)
             tenant.placed[h] = tenant.placed.get(h, 0.0) + alloc
             best_node.remaining[h] -= alloc
+            best_node.tenants_assigned.add(tenant.tenant_id)
             placed_total += alloc
 
     return placed_total
@@ -225,6 +227,68 @@ class IterStats:
     elapsed_s:         float
 
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# § OBJECTIVE SCORING
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def compute_objective(
+    completed: list,
+    all_nodes: list,
+    lam: dict | None = None,
+    n_periods: int = N_PERIODS,
+) -> dict:
+    """
+    Compute the MISOCP objective value from the iterative solution placement.
+
+    Objective = lam[0]*InfraCost - lam[1]*sigma - lam[2]*MixBonus
+
+    Components:
+      InfraCost : number of nodes actually used (activated)
+      sigma     : minimum demand-satisfaction fraction across all tenants
+      MixBonus  : number of nodes that have both heavy and light tenants assigned
+
+    Returns dict with all components and the final objective value.
+    """
+    if lam is None:
+        lam = {0: 1.0, 1: 5.0, 2: 2.0}
+
+    # ── InfraCost: count nodes that were actually used ─────────────────────────
+    nodes_used = [n for n in all_nodes if len(n.tenants_assigned) > 0]
+    infra_cost = float(len(nodes_used))
+
+    # ── Fairness sigma: minimum satisfaction across all tenants ───────────────
+    satisfactions = [t.satisfaction_frac() for t in completed]
+    sigma = min(satisfactions) if satisfactions else 0.0
+
+    # ── Mix Bonus: nodes with both heavy and light tenants ────────────────────
+    # Classify tenants by average demand
+    if completed:
+        avg_demands = {t.tenant_id: t.total_demand() / max(1, n_periods)
+                       for t in completed}
+        median_demand = sorted(avg_demands.values())[len(avg_demands) // 2]
+        heavy_ids = {tid for tid, d in avg_demands.items() if d >= median_demand}
+        light_ids = {tid for tid, d in avg_demands.items() if d < median_demand}
+
+        mix_bonus = sum(
+            1 for n in nodes_used
+            if (n.tenants_assigned & heavy_ids) and (n.tenants_assigned & light_ids)
+        )
+    else:
+        mix_bonus = 0
+
+    # ── Final objective ────────────────────────────────────────────────────────
+    obj_val = lam[0] * infra_cost - lam[1] * sigma - lam[2] * mix_bonus
+
+    return {
+        "obj_val":    round(obj_val, 4),
+        "infra_cost": round(infra_cost, 4),
+        "sigma":      round(sigma, 4),
+        "mix_bonus":  round(float(mix_bonus), 4),
+        "nodes_used": len(nodes_used),
+        "n_tenants":  len(completed),
+    }
+
 def run_iterative(
     total_tenants: int = TOTAL_TENANTS,
     seed:          int = SEED,
@@ -241,11 +305,13 @@ def run_iterative(
     while tenant_queue and len(active_tenants) < UNIT_TENANTS:
         active_tenants.append(tenant_queue.popleft())
 
-    active_nodes: list[IterNode] = [_fresh_node(i) for i in range(UNIT_NODES)]
-    next_node_id = UNIT_NODES
-
     completed:  list[IterTenant] = []
     stats_log:  list[IterStats]  = []
+    all_nodes_used: list[IterNode] = []   # tracks every node ever activated
+
+    active_nodes: list[IterNode] = [_fresh_node(i) for i in range(UNIT_NODES)]
+    all_nodes_used.extend(active_nodes)
+    next_node_id = UNIT_NODES
     stall_count = 0
     t_wall = time.perf_counter()
 
@@ -290,6 +356,7 @@ def run_iterative(
                 fresh = _fresh_node(next_node_id)
                 next_node_id += 1
                 new_nodes.append(fresh)
+                all_nodes_used.append(fresh)
                 nodes_provisioned += 1
             else:
                 new_nodes.append(node)
@@ -306,6 +373,7 @@ def run_iterative(
                 fresh = _fresh_node(next_node_id)
                 next_node_id += 1
                 active_nodes.append(fresh)
+                all_nodes_used.append(fresh)
                 nodes_evicted    += 1
                 nodes_provisioned += 1
                 stall_count = 0
@@ -336,7 +404,8 @@ def run_iterative(
                 active_nodes.append(_fresh_node(next_node_id))
                 next_node_id += 1
 
-    return stats_log, completed
+    obj_metrics = compute_objective(completed, all_nodes_used)
+    return stats_log, completed, obj_metrics
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -415,12 +484,16 @@ def main() -> None:
     print(f"  Demand : u[i,h] ∈ [{DEMAND_MIN}, {DEMAND_MAX}]  ×  {N_PERIODS} periods")
     print(f"  Node   : {NODE_CAPACITY} capacity units/period, evict < {EVICT_THRESH*100:.0f}% remaining")
 
-    stats, completed = run_iterative(
+    stats, completed, obj_metrics = run_iterative(
         total_tenants=args.tenants,
         seed=args.seed,
         verbose=True,
     )
     _report(stats, completed, args.tenants)
+    print(f"\n  Objective value  : {obj_metrics['obj_val']}")
+    print(f"  InfraCost        : {obj_metrics['infra_cost']} nodes activated")
+    print(f"  Fairness sigma   : {obj_metrics['sigma']:.4f}")
+    print(f"  Mix bonus        : {obj_metrics['mix_bonus']} nodes with heavy+light mix")
 
     if args.csv:
         out_dir = Path(__file__).resolve().parent.parent / "Pipeline" / "timing_data"

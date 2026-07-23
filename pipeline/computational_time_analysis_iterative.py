@@ -158,9 +158,10 @@ class RTIterResult:
 class PAIterResult:
     n_tenants:    int
     iterations:   int
-    satisfaction: float   # 0–1
+    satisfaction: float        # 0–1
     nodes_used:   int
     elapsed_s:    float
+    obj_val:      float | None  # iterative objective value (lam0*cost - lam1*sigma - lam2*mix)
 
 
 @dataclass
@@ -169,9 +170,10 @@ class PAIterGridResult:
     n_tenants:    int
     n_nodes:      int      # active node-pool size (UNIT_NODES) for this run
     iterations:   int
-    satisfaction: float    # 0–1
+    satisfaction: float        # 0–1
     nodes_used:   int
     elapsed_s:    float
+    obj_val:      float | None  # iterative objective value
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -260,13 +262,14 @@ def time_rt_iter(n_jobs: int, n_nodes: int,
 def time_pa_iter(n_tenants: int) -> PAIterResult:
     t0 = time.perf_counter()
     try:
-        stats, completed = run_iterative(
+        stats, completed, obj_metrics = run_iterative(
             total_tenants=n_tenants, seed=PA_SEED, verbose=False,
         )
     except Exception as exc:
         _pr(f"PA-iter T={n_tenants} ERR: {exc}")
         return PAIterResult(n_tenants=n_tenants, iterations=0,
-                            satisfaction=0.0, nodes_used=0, elapsed_s=0.0)
+                            satisfaction=0.0, nodes_used=0, elapsed_s=0.0,
+                            obj_val=None)
 
     elapsed_s = time.perf_counter() - t0
     iters     = len(stats)
@@ -275,11 +278,12 @@ def time_pa_iter(n_tenants: int) -> PAIterResult:
         sum(c.satisfaction_frac() for c in completed) / max(1, len(completed))
         if completed else 0.0
     )
+    obj_val = obj_metrics.get("obj_val") if obj_metrics else None
     _pr(f"PA-iter T={n_tenants:<5} → {elapsed_s:.4f}s  "
-        f"iters={iters}  sat={satisfaction:.1%}  nodes={nodes_used}")
+        f"iters={iters}  sat={satisfaction:.1%}  nodes={nodes_used}  obj={obj_val}")
     return PAIterResult(n_tenants=n_tenants, iterations=iters,
                         satisfaction=satisfaction, nodes_used=nodes_used,
-                        elapsed_s=elapsed_s)
+                        elapsed_s=elapsed_s, obj_val=obj_val)
 
 
 def time_pa_iter_grid(n_tenants: int, n_nodes: int) -> PAIterGridResult:
@@ -293,7 +297,7 @@ def time_pa_iter_grid(n_tenants: int, n_nodes: int) -> PAIterGridResult:
     _pai.UNIT_NODES = n_nodes
     try:
         t0 = time.perf_counter()
-        stats, completed = _pai.run_iterative(
+        stats, completed, obj_metrics = _pai.run_iterative(
             total_tenants=n_tenants, seed=PA_SEED, verbose=False,
         )
         elapsed_s = time.perf_counter() - t0
@@ -301,7 +305,7 @@ def time_pa_iter_grid(n_tenants: int, n_nodes: int) -> PAIterGridResult:
         _pr(f"PA-grid T={n_tenants:<5} N={n_nodes:<5} ERR: {exc}")
         return PAIterGridResult(n_tenants=n_tenants, n_nodes=n_nodes,
                                 iterations=0, satisfaction=0.0,
-                                nodes_used=0, elapsed_s=0.0)
+                                nodes_used=0, elapsed_s=0.0, obj_val=None)
     finally:
         _pai.UNIT_NODES = old_units
 
@@ -311,11 +315,12 @@ def time_pa_iter_grid(n_tenants: int, n_nodes: int) -> PAIterGridResult:
         sum(c.satisfaction_frac() for c in completed) / max(1, len(completed))
         if completed else 0.0
     )
+    obj_val = obj_metrics.get("obj_val") if obj_metrics else None
     _pr(f"PA-grid T={n_tenants:<5} N={n_nodes:<5} → {elapsed_s*1000:>9.1f} ms  "
-        f"iters={iters}  sat={satisfaction:.1%}")
+        f"iters={iters}  sat={satisfaction:.1%}  obj={obj_val}")
     return PAIterGridResult(n_tenants=n_tenants, n_nodes=n_nodes,
                             iterations=iters, satisfaction=satisfaction,
-                            nodes_used=nodes_used, elapsed_s=elapsed_s)
+                            nodes_used=nodes_used, elapsed_s=elapsed_s, obj_val=obj_val)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -673,6 +678,7 @@ def _load_pa_iter_csv() -> list[PAIterResult]:
                 satisfaction=float(row["satisfaction"]),
                 nodes_used=int(row["nodes_used"]),
                 elapsed_s=float(row["elapsed_s"]),
+                obj_val=float(row["obj_val"]) if row.get("obj_val") else None,
             ))
     return results
 
@@ -690,6 +696,7 @@ def _load_pa_iter_grid_csv(fname: str = "pa_iter_grid.csv") -> dict:
                     satisfaction=float(row["satisfaction"]),
                     nodes_used=int(row["nodes_used"]),
                     elapsed_s=float(row["elapsed_s"]),
+                    obj_val=float(row["obj_val"]) if row.get("obj_val") else None,
                 )
     return grid
 
@@ -779,9 +786,10 @@ def run_pa(tenant_counts: list[int]) -> list[PAIterResult]:
               f"{r.elapsed_s:>9.3f}s")
 
     _save_csv("pa_iter_timing.csv",
-              ["n_tenants", "iterations", "satisfaction", "nodes_used", "elapsed_s"],
+              ["n_tenants", "iterations", "satisfaction", "nodes_used", "elapsed_s", "obj_val"],
               [[r.n_tenants, r.iterations, round(r.satisfaction, 6),
-                r.nodes_used, round(r.elapsed_s, 6)]
+                r.nodes_used, round(r.elapsed_s, 6),
+                round(r.obj_val, 4) if r.obj_val is not None else ""]
                for r in pa_results])
 
     return pa_results
@@ -829,9 +837,10 @@ def run_pa_grid(tenants_list: list[int], nodes_list: list[int],
 
     _save_csv(csv_name,
               ["n_tenants", "n_nodes", "iterations", "satisfaction",
-               "nodes_used", "elapsed_s"],
+               "nodes_used", "elapsed_s", "obj_val"],
               [[r.n_tenants, r.n_nodes, r.iterations, round(r.satisfaction, 6),
-                r.nodes_used, round(r.elapsed_s, 6)]
+                r.nodes_used, round(r.elapsed_s, 6),
+                round(r.obj_val, 4) if r.obj_val is not None else ""]
                for r in grid.values() if r is not None])
 
     return grid
