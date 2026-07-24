@@ -293,10 +293,17 @@ def run_iterative(
     total_tenants: int = TOTAL_TENANTS,
     seed:          int = SEED,
     verbose:       bool = True,
+    n_periods:     int | None = None,
 ) -> tuple[list[IterStats], list[IterTenant]]:
     """
     Run the iterative allocation and return (iteration_log, completed_tenants).
     """
+    import plan_ahead_iterative as _self_module
+    _original_periods = _self_module.N_PERIODS
+    if n_periods is not None:
+        _self_module.N_PERIODS = n_periods
+        globals()["N_PERIODS"] = n_periods
+
     tenant_queue  = _make_tenants(total_tenants, seed)
     next_node_id  = 0
 
@@ -404,7 +411,10 @@ def run_iterative(
                 active_nodes.append(_fresh_node(next_node_id))
                 next_node_id += 1
 
-    obj_metrics = compute_objective(completed, all_nodes_used)
+    obj_metrics = compute_objective(completed, all_nodes_used,
+                                    n_periods=_self_module.N_PERIODS)
+    _self_module.N_PERIODS = _original_periods
+    globals()["N_PERIODS"] = _original_periods
     return stats_log, completed, obj_metrics
 
 

@@ -1,0 +1,10 @@
+experiment,n_tenants,n_nodes,n_periods,slot_hours,iterations,satisfaction,nodes_used,elapsed_s,obj_val
+iter_period_sweep,2,64,8,6.0,1,1.0,64,0.000508,-3.0
+iter_period_sweep,2,256,8,6.0,1,1.0,256,0.001278,-3.0
+iter_period_sweep,2,1024,8,6.0,1,1.0,1024,0.004462,-3.0
+iter_period_sweep,8,64,8,6.0,1,1.0,64,0.000623,3.0
+iter_period_sweep,8,256,8,6.0,1,1.0,256,0.001928,3.0
+iter_period_sweep,8,1024,8,6.0,1,1.0,1024,0.007235,3.0
+iter_period_sweep,128,64,8,6.0,0,0.0,0,0.0,
+iter_period_sweep,128,256,8,6.0,16,1.0,256,0.027987,123.0
+iter_period_sweep,128,1024,8,6.0,16,1.0,1024,0.068346,123.0
