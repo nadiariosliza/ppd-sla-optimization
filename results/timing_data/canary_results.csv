@@ -1,0 +1,4 @@
+label,T,N,P,status,build_s,solve_s,n_vars,n_bin_vars,n_cont_vars,n_constrs,obj_val,mip_gap
+row26_T2500_N5000_P1,2500,5000,1,ERR_GurobiError,,,,,,,,
+row29_T2500_N5000_P4,2500,5000,4,ERR_GurobiError,,,,,,,,
+row27_T2500_N1000_P8,2500,1000,8,ERR_GurobiError,,,,,,,,

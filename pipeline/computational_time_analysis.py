@@ -197,9 +197,9 @@ EXP_B_CAP_S        = 5 * 60        # 5 minutes (same as baseline)
 # Experiment C — Weekly horizon (P=7, one 24-hour slot per day, 4-hour cap)
 EXP_C_PERIODS      = 7             # 7 daily slots = 1 week
 EXP_C_SLOT_HOURS   = 24            # hours per slot
-EXP_C_CAP_S        = 4 * 60 * 60  # 4 hours
-EXP_C_TENANTS      = [2, 8, 128, 256, 512]
-EXP_C_NODES        = [4, 16, 64, 256, 512, 1024]
+EXP_C_CAP_S        = 12 * 60 * 60  # 12 hours
+EXP_C_TENANTS      = [256, 512]
+EXP_C_NODES        = [1024, 512]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
