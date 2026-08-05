@@ -169,6 +169,8 @@ class PAIterGridResult:
     """One (tenants, machines) cell of the PA-iterative T × N wall-time sweep."""
     n_tenants:    int
     n_nodes:      int      # active node-pool size (UNIT_NODES) for this run
+    n_periods:    int      # planning horizon periods
+    slot_hours:   float    # hours per period
     iterations:   int
     satisfaction: float        # 0–1
     nodes_used:   int
@@ -286,7 +288,7 @@ def time_pa_iter(n_tenants: int) -> PAIterResult:
                         elapsed_s=elapsed_s, obj_val=obj_val)
 
 
-def time_pa_iter_grid(n_tenants: int, n_nodes: int) -> PAIterGridResult:
+def time_pa_iter_grid(n_tenants: int, n_nodes: int, n_periods: int | None = None, slot_hours: float = 6.0) -> PAIterGridResult:
     """
     Time one (tenants, machines) cell. The iterative runner reads its node-pool
     size from the module global UNIT_NODES, so we set it for the duration of this
@@ -299,11 +301,13 @@ def time_pa_iter_grid(n_tenants: int, n_nodes: int) -> PAIterGridResult:
         t0 = time.perf_counter()
         stats, completed, obj_metrics = _pai.run_iterative(
             total_tenants=n_tenants, seed=PA_SEED, verbose=False,
+            n_periods=n_periods,
         )
         elapsed_s = time.perf_counter() - t0
     except Exception as exc:
         _pr(f"PA-grid T={n_tenants:<5} N={n_nodes:<5} ERR: {exc}")
         return PAIterGridResult(n_tenants=n_tenants, n_nodes=n_nodes,
+                                n_periods=n_periods or 4, slot_hours=slot_hours,
                                 iterations=0, satisfaction=0.0,
                                 nodes_used=0, elapsed_s=0.0, obj_val=None)
     finally:
@@ -319,6 +323,7 @@ def time_pa_iter_grid(n_tenants: int, n_nodes: int) -> PAIterGridResult:
     _pr(f"PA-grid T={n_tenants:<5} N={n_nodes:<5} → {elapsed_s*1000:>9.1f} ms  "
         f"iters={iters}  sat={satisfaction:.1%}  obj={obj_val}")
     return PAIterGridResult(n_tenants=n_tenants, n_nodes=n_nodes,
+                            n_periods=n_periods or 4, slot_hours=slot_hours,
                             iterations=iters, satisfaction=satisfaction,
                             nodes_used=nodes_used, elapsed_s=elapsed_s, obj_val=obj_val)
 
@@ -692,6 +697,8 @@ def _load_pa_iter_grid_csv(fname: str = "pa_iter_grid.csv") -> dict:
                 t, n = int(row["n_tenants"]), int(row["n_nodes"])
                 grid[(t, n)] = PAIterGridResult(
                     n_tenants=t, n_nodes=n,
+                    n_periods=int(row.get("n_periods", 4)),
+                    slot_hours=float(row.get("slot_hours", 6.0)),
                     iterations=int(row["iterations"]),
                     satisfaction=float(row["satisfaction"]),
                     nodes_used=int(row["nodes_used"]),
@@ -1296,7 +1303,54 @@ def main() -> None:
         title=f"Plan-Ahead Iterative — Small Grid Wall Time  "
               f"(P={_pai.N_PERIODS} periods, tenant window {_pai.UNIT_TENANTS})")
     print()
+def _run_iter_experiment(experiment, tenants_list, nodes_list, n_periods, slot_hours, csv_name):
+    valid = [(t, n) for t in tenants_list for n in nodes_list if n >= t]
+    skip  = [(t, n) for t in tenants_list for n in nodes_list if n < t]
+    print(f"\n  Iterative {experiment.upper()} — P={n_periods}  horizon={int(n_periods*slot_hours)}h")
+    print(f"  Grid: T={tenants_list}  N={nodes_list}")
+    print(f"  {len(valid)} active, {len(skip)} skipped")
+    grid = {}
+    for t, n in skip:
+        grid[(t, n)] = PAIterGridResult(
+            n_tenants=t, n_nodes=n, n_periods=n_periods, slot_hours=slot_hours,
+            iterations=0, satisfaction=0.0, nodes_used=0, elapsed_s=0.0, obj_val=None,
+        )
+    for t, n in valid:
+        r = time_pa_iter_grid(t, n, n_periods=n_periods, slot_hours=slot_hours)
+        grid[(t, n)] = r
+        _pr(f"  iter-{experiment} T={t:<5} N={n:<5} P={n_periods} → "
+            f"{r.elapsed_s*1000:.1f}ms  sat={r.satisfaction:.1%}  obj={r.obj_val}")
+    _save_csv(csv_name,
+              ["experiment","n_tenants","n_nodes","n_periods","slot_hours",
+               "iterations","satisfaction","nodes_used","elapsed_s","obj_val"],
+              [[experiment, r.n_tenants, r.n_nodes, r.n_periods, r.slot_hours,
+                r.iterations, round(r.satisfaction,6), r.nodes_used,
+                round(r.elapsed_s,6),
+                round(r.obj_val,4) if r.obj_val is not None else ""]
+               for r in sorted(grid.values(), key=lambda x: (x.n_tenants, x.n_nodes))])
 
+
+def run_iter_period_sweep():
+    for p in [2, 4, 6, 8]:
+        _run_iter_experiment("iter_period_sweep", [2,8,128], [64,256,1024],
+                             p, 6.0, f"pa_iter_period_sweep_P{p}.csv")
+    print("\n  All period sweep CSV files saved.")
+
+
+def run_iter_weekly():
+    _run_iter_experiment("iter_weekly", [2,8,128,256,512], [4,16,64,256,512,1024],
+                         7, 24.0, "pa_iter_weekly.csv")
 
 if __name__ == "__main__":
-    main()
+    import sys as _sys
+    if "--mode" in _sys.argv:
+        idx = _sys.argv.index("--mode")
+        mode = _sys.argv[idx + 1] if idx + 1 < len(_sys.argv) else None
+        if mode == "period_sweep":
+            run_iter_period_sweep()
+        elif mode == "weekly":
+            run_iter_weekly()
+        else:
+            print(f"Unknown mode: {mode}")
+    else:
+        main()
